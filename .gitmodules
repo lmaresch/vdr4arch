@@ -1,0 +1,3 @@
+[submodule "plugins/vdr-nordlichtsepg"]
+	path = plugins/vdr-nordlichtsepg
+	url = git@github.com:lmaresch/vdr-nordlichtsepg.git
