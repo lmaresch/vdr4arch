@@ -18,7 +18,10 @@ source=("ftp://ftp.tvdr.de/vdr/${pkgbase}-${pkgver}.tar.bz2"
         'shutdown.sh'
         'shutdown-wrapper.c'
         'vdr.service'
-        'vdr.sysuser')
+        'vdr.sysuser'
+        'vdr-2.4.1-camtweaks-2.3.patch'
+        'vdr-2.4.1-mtd-lockedtctspostprocess.patch'
+        'vdr-2.4.1-mtd-stopdecrypting.patch')
 md5sums=('b2897fe6b6e6711d512a69642b1b8ec1'
          '292e065582d97ed1ae4977a2a7b6091d'
          'de3dcdea1a4282211c6dac370019548b'
@@ -29,7 +32,10 @@ md5sums=('b2897fe6b6e6711d512a69642b1b8ec1'
          'dd20f932b846b5f50ac455b65e9432ad'
          '7cad811b4ac5ee6c0b5496d006f1e0ee'
          '6c021358f299dca9ef7bbeb163312690'
-         '59ce04d1d01bf92bf6cfc0b74223191c')
+         '59ce04d1d01bf92bf6cfc0b74223191c'
+         '7b137fc1b4930e96af99f1006ec3d299'
+         '7f6ff405786aea3f5a8177c58a15cda9'
+         'eff14f2ba9dc14c34d083789fb2f734a')
 
 prepare() {
   cd "${srcdir}/${pkgbase}-${pkgver}"
@@ -44,6 +50,9 @@ prepare() {
 
   # Custom extensions
   patch -p1 -i "$srcdir/vdr-MainMenuHooks.patch"
+  patch -p1 -i "$srcdir/vdr-2.4.1-camtweaks-2.3.patch"
+  patch -p1 -i "$srcdir/vdr-2.4.1-mtd-lockedtctspostprocess.patch"
+  patch -p1 -i "$srcdir/vdr-2.4.1-mtd-stopdecrypting.patch"
 
   # Don't install plugins with VDR
   sed -i '/^install: /s/install-plugins //' Makefile
