@@ -4,3 +4,6 @@
 [submodule "plugins/vdr-vaapidevice"]
 	path = plugins/vdr-vaapidevice
 	url = https://github.com/lmaresch/vdr-vaapidevice.git
+[submodule "plugins/vdr-ciplus"]
+	path = plugins/vdr-ciplus
+	url = https://github.com/lmaresch/vdr-ciplus.git
