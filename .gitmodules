@@ -1,0 +1,6 @@
+[submodule "plugins/vdr-nordlichtsepg"]
+	path = plugins/vdr-nordlichtsepg
+	url = https://github.com/lmaresch/vdr-nordlichtsepg.git
+[submodule "plugins/vdr-vaapidevice"]
+	path = plugins/vdr-vaapidevice
+	url = https://github.com/lmaresch/vdr-vaapidevice.git
