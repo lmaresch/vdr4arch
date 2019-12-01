@@ -1,0 +1,58 @@
+diff -Nurp vdr-2.4.1.camtweaks2.2pre15/ci.c vdr-2.4.1.camtweaks2.2pre16/ci.c
+--- vdr-2.4.1.camtweaks2.2pre15/ci.c	2019-07-29 21:03:41.480279194 +0200
++++ vdr-2.4.1.camtweaks2.2pre16/ci.c	2019-07-29 23:25:27.217763988 +0200
+@@ -3281,9 +3281,13 @@ void cCamSlot::StartDecrypting(void)
+ void cCamSlot::StopDecrypting(void)
+ {
+   cMutexLock MutexLock(&mutex);
++  if (mtdHandler) {
++     mtdHandler->StopDecrypting();
++     return;
++     }
+   if (caProgramList.Count()) {
+      caProgramList.Clear();
+-     if (!dynamic_cast<cMtdCamSlot *>(this))
++     if (!dynamic_cast<cMtdCamSlot *>(this) || !MasterSlot()->IsDecrypting())
+         SendCaPmt(CPCI_NOT_SELECTED);
+      }
+ }
+diff -Nurp vdr-2.4.1.camtweaks2.2pre15/mtd.c vdr-2.4.1.camtweaks2.2pre16/mtd.c
+--- vdr-2.4.1.camtweaks2.2pre15/mtd.c	2019-07-28 21:38:52.323319572 +0200
++++ vdr-2.4.1.camtweaks2.2pre16/mtd.c	2019-07-29 23:31:41.491133308 +0200
+@@ -197,6 +197,15 @@ void cMtdHandler::StartDecrypting(void)
+       }
+ }
+ 
++void cMtdHandler::StopDecrypting(void)
++{
++  for (int i = 0; i < camSlots.Size(); i++) {
++      if (camSlots[i]->Device()) {
++         camSlots[i]->StopDecrypting();
++         }
++      }
++}
++
+ void cMtdHandler::CancelActivation(void)
+ {
+   for (int i = 0; i < camSlots.Size(); i++)
+@@ -414,8 +423,6 @@ void cMtdCamSlot::StartDecrypting(void)
+ void cMtdCamSlot::StopDecrypting(void)
+ {
+   cCamSlot::StopDecrypting();
+-  if (!MasterSlot()->IsDecrypting())
+-     MasterSlot()->StopDecrypting();
+   cMutexLock MutexLock(&clearMutex);
+   mtdMapper->Clear();
+   mtdBuffer->Clear();
+diff -Nurp vdr-2.4.1.camtweaks2.2pre15/mtd.h vdr-2.4.1.camtweaks2.2pre16/mtd.h
+--- vdr-2.4.1.camtweaks2.2pre15/mtd.h	2019-07-27 18:48:49.787260490 +0200
++++ vdr-2.4.1.camtweaks2.2pre16/mtd.h	2019-07-29 23:16:58.371048287 +0200
+@@ -142,6 +142,8 @@ public:
+       ///< Returns true if any of the active MTD CAM slots is currently decrypting.
+   void StartDecrypting(void);
+       ///< Tells all active MTD CAM slots to start decrypting.
++  void StopDecrypting(void);
++      ///< Tells all active MTD CAM slots to stop decrypting.
+   void CancelActivation(void);
+       ///< Tells all active MTD CAM slots to cancel activation.
+   bool IsActivating(void);
