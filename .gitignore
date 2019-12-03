@@ -9,6 +9,7 @@ pkg/
 src/
 repo/
 /aur-git-cache
+build/
 
 .vscode/
 deps/graphlcd-base/graphlcd-base/
