@@ -5,7 +5,7 @@ pkgbase=vdr
 pkgname=(vdr vdr-examples)
 pkgver=2.4.1
 _vdrapi=2.4.1
-pkgrel=14
+pkgrel=15
 url="http://tvdr.de/"
 arch=('x86_64' 'i686' 'arm' 'armv6h' 'armv7h')
 license=('GPL2')
@@ -50,9 +50,9 @@ prepare() {
 
   # Custom extensions
   patch -p1 -i "$srcdir/vdr-MainMenuHooks.patch"
-  patch -p1 -i "$srcdir/vdr-2.4.1-camtweaks-2.3.patch"
-  patch -p1 -i "$srcdir/vdr-2.4.1-mtd-lockedtctspostprocess.patch"
-  patch -p1 -i "$srcdir/vdr-2.4.1-mtd-stopdecrypting.patch"
+  #patch -p1 -i "$srcdir/vdr-2.4.1-camtweaks-2.3.patch"
+  #patch -p1 -i "$srcdir/vdr-2.4.1-mtd-lockedtctspostprocess.patch"
+  #patch -p1 -i "$srcdir/vdr-2.4.1-mtd-stopdecrypting.patch"
 
   # Don't install plugins with VDR
   sed -i '/^install: /s/install-plugins //' Makefile
