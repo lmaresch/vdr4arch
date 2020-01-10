@@ -27,12 +27,17 @@ class Pkgbuild:
         self.ignoredparams = ['source', 'sha256sums', 'md5sums', 'sha512sums', 'install', 'backup', 'url', 'license']
         self.packagefilename = ''
         self.packagedebugfilename = ''
+
+    def __str__(self):
+        return '| {0:30.30} | {1:20.20} | {2:4} | {3:50.50} | {4:60.60} |'.format(self.pkgname, self.pkgver, self.pkgrel, str(self.archs), str(self.depends))
+
     def parsefile(self):
         try:
             debug('Parsing file {0}...'.format(self.pkgbuildpath))
             with open(self.pkgbuildpath, 'r') as f:
-                for line in f.readlines():
-                    debug2('Parsing line: {0}'.format(line.replace(os.linesep, '')))
+                for rawline in f.readlines():
+                    line = rawline.replace(os.linesep, '')
+                    debug2('Parsing line: {0}'.format(line))
                     if not line.strip() or line[:1] == '#' or not '=' in line or line[:line.index('=')] in self.ignoredparams:
                         continue
                     if line.startswith('pkgname'):
@@ -74,23 +79,25 @@ class Pkgbuild:
             self.pkgver = self._evaluatevariables(self.pkgver)
         if '$' in self.pkgrel:
             self.pkgrel = self._evaluatevariables(self.pkgrel)
-        for entry in self.archs:
-            if '$' in entry:
-                entry = self._evaluatevariables(entry)
-        for entry in self.depends:
-            if '$' in entry:
-                entry = self._evaluatevariables(entry)
-        for entry in self.conflicts:
-            if '$' in entry:
-                entry = self._evaluatevariables(entry)
-        for entry in self.optdepends:
-            if '$' in entry:
-                entry = self._evaluatevariables(entry)
-        for entry in self.makedepends:
-            if '$' in entry:
-                entry = self._evaluatevariables(entry)
+        self._enumandreplacevariables(self.archs)
+        self._enumandreplacevariables(self.depends)
+        self._enumandreplacevariables(self.conflicts)
+        self._enumandreplacevariables(self.optdepends)
+        self._enumandreplacevariables(self.makedepends)
         return True
+
+    def executesonarch(self, architecture):
+        if architecture in self.archs:
+            return True
+        if 'any' in self.archs:
+            return True
+        return False
     
+    def _enumandreplacevariables(self, array):
+        for idx, entry in enumerate(array):
+            if '$' in entry:
+                array[idx] = self._evaluatevariables(entry)
+
     def _evaluatevariables(self, value):
         prefix = '$'
         varname = ''
@@ -100,8 +107,7 @@ class Pkgbuild:
             prefix = '${'
             postfix = '}'
         for entry in self.unknownparams:
-            if prefix + entry + postfix in value:
-                value.replace(prefix + entry + postfix, self.unknownparams[entry])
+            value = value.replace(prefix + entry + postfix, self.unknownparams[entry])
         return value
 
 class bcolors:
@@ -137,8 +143,9 @@ def readmakepkgconf():
     config = dict()
     try:
         with open(makepkgconf, 'r') as f:
-            for line in f.readlines():
-                debug2('Linecontent: {0}'.format(line.replace('\n', '')))
+            for rawline in f.readlines():
+                line = rawline.replace('\n', '')
+                debug2('Linecontent: {0}'.format(line))
                 if not line.strip() or line[:1] == '#':
                     debug2('--> Line is ignored as it is empty or starts with a \'#\'')
                     continue
@@ -158,8 +165,9 @@ def getentriesfromrepomakeconf(repomakefile):
     try:
         info('Reading file \'' + repomakeconf + '\'...')
         with open(repomakeconf, 'r') as repomakefile:
-            for repomakeline in repomakefile.readlines():
-                debug2('Linecontent: {0}'.format(repomakeline.replace('\n', '')))
+            for rawrepomakeline in repomakefile.readlines():
+                repomakeline = rawrepomakeline.replace('\n', '')
+                debug2('Linecontent: {0}'.format(repomakeline))
                 if not repomakeline.strip() or repomakeline[:1] == '#':
                     debug2('--> Line is ignored as it is empty or starts with a \'#\'')
                     continue
@@ -211,6 +219,14 @@ debug('makepkgconf: {0}'.format(str(makepkgconf)))
 repomakeconf = 'repo-make.conf'
 pkgbuildfiles = getentriesfromrepomakeconf(repomakeconf)
 pkgbuilds = analyzepkgbuildfiles(pkgbuildfiles)
+debug('\n'.join('{}'.format(k) for k in pkgbuilds))
+info('Checking if packages can be built with architecture retrieved from /etc/makepkg.conf: {}'.format(makepkgconf['CARCH']))
+for idx, entry in enumerate(pkgbuilds):
+    if entry.executesonarch(makepkgconf['CARCH']):
+        debug2('Package \'{0}\' can be built on architecture {1}'.format(entry.pkgname, makepkgconf['CARCH']))
+    else:
+        warning('Package \'{0}\' will be disabled on \'{1}\' as it requires one of the following architectures: {2}'.format(entry.pkgname, makepkgconf['CARCH'], str(entry.archs)))
+        pkgbuilds.remove(entry)
 
 
 #info('Synchronizing package lists...')
