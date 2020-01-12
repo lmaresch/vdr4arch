@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-#needs python-dateutil, python-pytz
+#needs python-dateutil, python-pytz, pyalpm
 
 import argparse
 import datetime
@@ -100,7 +100,6 @@ class Pkgbuild:
 
     def _evaluatevariables(self, value):
         prefix = '$'
-        varname = ''
         postfix = ''
         pos = value.index(prefix) + 1
         if value[pos] == '{':
@@ -121,21 +120,21 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 def info(text):
-    print(bcolors.BOLD + bcolors.OKGREEN + str(datetime.datetime.now()) + ' INF: ' + bcolors.ENDC + bcolors.OKGREEN + str(text) + bcolors.ENDC)
+    print(bcolors.OKGREEN + str(datetime.datetime.now()) + ' INF: ' + bcolors.ENDC + bcolors.BOLD + bcolors.OKGREEN + str(text) + bcolors.ENDC)
 
 def debug(text):
     if debugflag > 0:
-        print(bcolors.BOLD + bcolors.OKBLUE + str(datetime.datetime.now()) + ' DBG: ' + bcolors.ENDC + bcolors.OKBLUE + str(text) + bcolors.ENDC)
+        print(bcolors.OKBLUE + str(datetime.datetime.now()) + ' DBG: ' + bcolors.ENDC + bcolors.BOLD + bcolors.OKBLUE + str(text) + bcolors.ENDC)
 
 def debug2(text):
     if debugflag > 1:
-        print(bcolors.BOLD + bcolors.OKBLUE + str(datetime.datetime.now()) + ' DBG: ' + bcolors.ENDC + bcolors.OKBLUE + str(text) + bcolors.ENDC)
+        print(bcolors.OKBLUE + str(datetime.datetime.now()) + ' DBG: ' + bcolors.ENDC + bcolors.BOLD + bcolors.OKBLUE + str(text) + bcolors.ENDC)
 
 def warning(text):
-    print(bcolors.BOLD + bcolors.WARNING + str(datetime.datetime.now()) + ' WRN: ' + bcolors.ENDC + bcolors.WARNING + str(text) + bcolors.ENDC)
+    print(bcolors.WARNING + str(datetime.datetime.now()) + ' WRN: ' + bcolors.ENDC + bcolors.BOLD + bcolors.WARNING + str(text) + bcolors.ENDC)
 
 def error(text):
-    print(bcolors.BOLD + bcolors.FAIL + str(datetime.datetime.now()) + ' ERR: ' + bcolors.ENDC + bcolors.FAIL + str(text) + bcolors.ENDC)
+    print(bcolors.FAIL + str(datetime.datetime.now()) + ' ERR: ' + bcolors.ENDC + bcolors.BOLD + bcolors.FAIL + str(text) + bcolors.ENDC)
 
 def readmakepkgconf():
     makepkgconf = '/etc/makepkg.conf'
@@ -189,7 +188,7 @@ def analyzepkgbuildfiles(pkgbuildfiles):
     try:
         info('Processing {0} entries...'.format(len(pkgbuildfiles)))
         for pkgbuildfile in pkgbuildfiles:
-            fullpath = os.path.join(str(builddir), str(pkgbuildfile), 'PKGBUILD')
+            fullpath = os.path.join(str(repodir), str(pkgbuildfile), 'PKGBUILD')
             if not os.path.exists(fullpath):
                 warning('File {0} doesn\'t exist, ignoring...'.format(fullpath))
                 continue
@@ -206,14 +205,26 @@ def analyzepkgbuildfiles(pkgbuildfiles):
         exit(1)
     return pkgbuilds
 
+def checkchroot(builddir):
+    info('Check if chroot is already present in {0}...'.format(builddir))
+    
+    return True
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--debug', '-d', action='count', default=0)
-parser.add_argument('--directory', '-D', action='store', default=os.getcwd())
+parser.add_argument('--debug', '-d', action='count', default=0, help='Enable debugging output.')
+parser.add_argument('--directory', '-D', action='store', default=os.getcwd(), help='Path to folder with repo-make.conf')
+parser.add_argument('--builddir', '-B', action='store', default='builddir', help='Sets the path to the build dir. Default is a build subfolder in the with repo-make.conf')
 args = parser.parse_args()
 
 debugflag = args.debug
-builddir = args.directory
+repodir = args.directory
+builddir = os.path.abspath(args.builddir)
 
+if os.getuid() != 0:
+    error('You need to have root privileges to run this script. Exiting.')
+    exit(1)
+if not checkchroot(builddir):
+    exit(1)
 makepkgconf = readmakepkgconf()
 debug('makepkgconf: {0}'.format(str(makepkgconf)))
 repomakeconf = 'repo-make.conf'
