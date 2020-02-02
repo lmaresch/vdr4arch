@@ -155,7 +155,7 @@ def readmakepkgconf():
         error('I/O error({0}): {1}'.format(e.errno, e.strerror))
         exit(1)
     except:
-        error('Unexpected error in {0}: '.format(str(__name__)) + sys.exc_info()[0])
+        error('Unexpected error in {0}: '.format(str(__name__)) + str(sys.exc_info()[0]))
         exit(1)
     return config
 
@@ -179,7 +179,7 @@ def getentriesfromrepomakeconf(repomakefile):
         error('I/O error({0}): {1}'.format(e.errno, e.strerror))
         exit(1)
     except:
-        error('Unexpected error in {0}: '.format(str(__name__)) + sys.exc_info()[0])
+        error('Unexpected error in {0}: '.format(str(__name__)) + str(sys.exc_info()[0]))
         exit(1)
     return pkgbuildfiles
 
@@ -201,33 +201,78 @@ def analyzepkgbuildfiles(pkgbuildfiles):
         error('I/O error({0}): {1}'.format(e.errno, e.strerror))
         exit(1)
     except:
-        error('Unexpected error in {0}: '.format(str(__name__)) + sys.exc_info()[0])
+        error('Unexpected error in {0}: '.format(str(__name__)) + str(sys.exc_info()[0]))
         exit(1)
     return pkgbuilds
 
 def checkchroot(builddir):
-    info('Check if chroot is already present in {0}...'.format(builddir))
-    
+    if os.path.exists(builddir):
+        info('Builddir \'{0}\' already exists...'.format(builddir))
+    else:
+        warning('Builddir \'{0}\' doesn\'t exist, creating it...'.format(builddir))
+        try:
+            os.makedirs(builddir)
+        except:
+            error('Could not create builddir \'{0}\': {1}'.format(builddir, str(__name__)) + str(sys.exc_info()[0]))
+            return False
+
+    rootdir = os.path.join(builddir, 'root')
+    if os.path.exists(rootdir):
+        info('Chroot seems to exist.')
+    else:
+        warning('Chroot doesn\'t exists, creating it...')
+        mkarchroot = subprocess.run(['/usr/bin/mkarchroot', rootdir, 'base-devel'])
+        if mkarchroot.returncode != 0:
+            error('Creating chroot environment failed with return code {0}.'.format(mkarchroot.returncode))
+            return False
+
+    info('Synchronizing package lists...')
+    pacman = subprocess.run(['/usr/bin/arch-nspawn', rootdir, '/usr/sbin/pacman', '-Sy'])
+    if pacman.returncode != 0:
+        error('pacman -Sy failed with return code ' + str(pacman.returncode))
+        return False
+
+    locallog = os.path.join(rootdir, 'var', 'log', 'pacman.log')
+    logline = ''
+    debug('Reading lofgile \'' + locallog + '\'...')
+    with open(locallog, 'r') as logfile:
+        for logline in reversed(list(logfile.readlines())):
+            debug2(logline.replace(os.linesep, ''))
+            if '[PACMAN] starting full system upgrade' in logline:
+                break
+    lastupdate = logline[logline.index('[') + 1:logline.index(']')]
+    debug('Last update: ' + str(lastupdate))
+    dt = parse(lastupdate)
+    if (datetime.datetime.now() - datetime.timedelta(days=-1)).replace(tzinfo=None) > dt.replace(tzinfo=None):
+        info('Last update done within the last day...')
+    else:
+        warning('Last update older then one day, updating...')
+        info('Upgrading system...')
+        pacman = subprocess.run(['/usr/bin/arch-nspawn', rootdir, '/usr/sbin/pacman', '-Su'])
+        if pacman.returncode != 0:
+            error('pacman -Su --noconfirm failed with return code ' + str(pacman.returncode))
+            return False
+        
     return True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--debug', '-d', action='count', default=0, help='Enable debugging output.')
 parser.add_argument('--directory', '-D', action='store', default=os.getcwd(), help='Path to folder with repo-make.conf')
-parser.add_argument('--builddir', '-B', action='store', default='builddir', help='Sets the path to the build dir. Default is a build subfolder in the with repo-make.conf')
+parser.add_argument('--builddir', '-B', action='store', default=os.getenv('CHROOT', 'builddir'), help='Sets the path to the build dir. First environment variable CHROOT is checked, if not existing, build subfolder in the folder with repo-make.conf is used.')
 args = parser.parse_args()
 
 debugflag = args.debug
 repodir = args.directory
 builddir = os.path.abspath(args.builddir)
 
-if os.getuid() != 0:
-    error('You need to have root privileges to run this script. Exiting.')
+if os.getuid() == 0:
+    error('This script cannot be executed as root. Exiting.')
     exit(1)
 if not checkchroot(builddir):
     exit(1)
 makepkgconf = readmakepkgconf()
 debug('makepkgconf: {0}'.format(str(makepkgconf)))
-repomakeconf = 'repo-make.conf'
+repomakeconf = os.path.join(repodir, 'repo-make.conf')
 pkgbuildfiles = getentriesfromrepomakeconf(repomakeconf)
 pkgbuilds = analyzepkgbuildfiles(pkgbuildfiles)
 debug('\n'.join('{}'.format(k) for k in pkgbuilds))
@@ -240,29 +285,4 @@ for idx, entry in enumerate(pkgbuilds):
         pkgbuilds.remove(entry)
 
 
-#info('Synchronizing package lists...')
-#pacman = subprocess.run(['/usr/sbin/pacman', '-Sy'])
-#if pacman.returncode != 0:
-#    error('pacman -Sy failed with return code ' + str(pacman.returncode))
-
-#locallog = '/var/log/pacman.log'
-#logline = ''
-#debug('Reading lofgile \'' + locallog + '\'...')
-#with open(locallog, 'r') as logfile:
-#    for logline in reversed(list(logfile.readlines())):
-#        debug2(logline.replace(os.linesep, ''))
-#        if '[PACMAN] starting full system upgrade' in logline:
-#            break
-
-#lastupdate = logline[logline.index('[') + 1:logline.index(']')]
-#debug('Last update: ' + str(lastupdate))
-#dt = parse(lastupdate)
-#if (datetime.datetime.now() - datetime.timedelta(days=-1)).replace(tzinfo=None) > dt.replace(tzinfo=None):
-#    info('Last update done within the last day...')
-#else:
-#    warning('Last update older then one day, updating...')
-#    info('Upgrading system...')
-#    pacman = subprocess.run(['/usr/sbin/pacman', '-Su', '--noconfirm'])
-#    if pacman.returncode != 0:
-#        error('pacman -Su --noconfirm failed with return code ' + str(pacman.returncode))
 
