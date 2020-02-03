@@ -7,3 +7,6 @@
 [submodule "plugins/vdr-ciplus"]
 	path = plugins/vdr-ciplus
 	url = https://github.com/lmaresch/vdr-ciplus.git
+[submodule "chrrepomake"]
+	path = chrrepomake
+	url = git@github.com:lmaresch/chrrepomake.git
