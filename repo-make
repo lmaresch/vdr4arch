@@ -29,7 +29,6 @@ use File::Copy;
 use File::Basename;
 use File::Path qw(make_path);
 use File::Spec::Functions qw(rel2abs);
-use File::Spec::Functions 'catfile';
 use POSIX;
 use Term::ANSIColor;
 use Archive::Tar;
@@ -37,697 +36,582 @@ $Archive::Tar::DO_NOT_USE_PREFIX = 1;
 use IPC::Open2;
 use IPC::Open3;
 use FileHandle;
-use feature 'state';
-use Carp;
-use English qw(-no_match_vars);
-use Readonly;
-use Time::Seconds;
-Readonly my $PW_NAME => 0;
-Readonly my $PW_UID  => 2;
-Readonly my $PW_GID  => 3;
-Readonly my $PW_DIR  => 7;
+use feature "state";
+use constant {
+  PW_NAME => 0,
+  PW_UID  => 2,
+  PW_GID  => 3,
+  PW_DIR  => 7
+};
 
-our $VERSION  = '1.2.0';
+my $VERSION = '1.2.0';
 my $PROGNAME = 'repo-make';
 
 # Main code
 {
-    # Colorize the error messages
-    local $SIG{__DIE__} = sub {
-        croak @ARG if ($EXCEPTIONS_BEING_CAUGHT);
-        print {*STDERR} color('bold red'), "==> $PROGNAME ERROR: ",
-          color('reset'),
-          color('bold'), $_[0], color('reset');
-        exit 1;
-    };
+  # Colorize the error messages
+  $SIG{__DIE__} =  sub {
+    die(@_) if ($^S);
+    print STDERR color('bold red'), "==> $PROGNAME ERROR: ", color('reset'),
+                 color('bold'), $_[0], color('reset');
+    exit(1);
+  };
 
-    # Read command line parameters
-    my %opts = (
-        'h'       => \&HELP_MESSAGE,
-        'version' => \&VERSION_MESSAGE,
-    );
-    GetOptions( \%opts, 'C|directory=s', 't|target=s', 'c|changeroot',
-        'V|verify', 'h|help', 'version' )
-      or HELP_MESSAGE();
+  # Read command line parameters
+  my %opts = (
+    'h'       => \&HELP_MESSAGE,
+    'version' => \&VERSION_MESSAGE,
+  );
+  GetOptions(\%opts, 'C|directory=s',
+                     't|target=s',
+                     'V|verify',
+                     'h|help',
+                     'version') or HELP_MESSAGE();
 
-    # Check privileges. We have to be root!
-    die "You have to be root to run repo-make!\n" if ( $REAL_USER_ID != 0 );
+  # Check privileges. We have to be root!
+  die("You have to be root to run repo-make!\n") if ($< != 0);
 
-    # Switch current directory if requested via command line
-    if ( $opts{C} ) {
-        chdir $opts{C}
-          or die "Failed to switch directory to $opts{C}: $OS_ERROR\n";
+  # Switch current directory if requested via command line
+  if ($opts{C}) {
+    chdir($opts{C}) or die("Failed to switch directory to $opts{C}: $!\n");
+  }
+
+  # Always get sure the package DB is up-to-date
+  InfoMsg('Synchronizing package lists...');
+  system('pacman', '-Sy');
+  die("pacman failed!\n") if ($?);
+
+  # If no upgrade for over 24 hours, then force upgrade!
+  if (time() - GetLastSystemUpgradeTime() > 24 * 60 * 60) {
+    InfoMsg('Upgrading build system...');
+    system('pacman', '-Su', '--noconfirm');
+    die("pacman failed!\n") if ($?);
+  }
+
+  # Read config file(s)
+  my %cfg;
+  ParseConfig('repo-make.conf', \%cfg, 1);
+  die("Missing REPONAME in repomake.conf\n") unless defined($cfg{REPONAME});
+  $cfg{TARGET} = 'repo';
+  ParseConfig('repo-make-custom.conf', \%cfg, 1)
+    if (-s 'repo-make-custom.conf');
+  $cfg{BUILDUSER} = 'build';
+  ParseConfig('/etc/repo-make.conf', \%cfg)
+    if (-s '/etc/repo-make.conf');
+
+  # Command line parameter "-t" overrides TARGET
+  $cfg{TARGET} = $opts{t} if ($opts{t});
+
+  # Read makepkg.conf
+  my $makepkgconf = ReadMakepkgConf();
+
+  # Replace "$CARCH" in TARGET
+  $cfg{TARGET} =~ s/\$CARCH/$makepkgconf->{CARCH}/;
+
+  # Export "PKGDEST" to make makepkg write packages directly to TARGET
+  $ENV{PKGDEST} = rel2abs($cfg{TARGET});
+
+  # Check for BUILDUSER. If not there, create it.
+  my @builduserinfo;
+  unless (@builduserinfo = getpwnam($cfg{BUILDUSER})) {
+    InfoMsg("Creating user '$cfg{BUILDUSER}'");
+    system('useradd', '-m', $cfg{BUILDUSER});
+    die("Failed to create user '$cfg{BUILDUSER}'\n") if ($?);
+    @builduserinfo = getpwnam($cfg{BUILDUSER}) or die($!);
+  }
+
+  # Check if BUILDUSER is able to reach our stuff.
+  system('su', $cfg{BUILDUSER}, '-c', 'cat repo-make.conf > /dev/null');
+  die("User '$cfg{BUILDUSER}' is not allowed to access build data\n") if ($?);
+
+  # Check for target directory. If missing, try to create it.
+  unless (-d $cfg{TARGET}) {
+    make_path($cfg{TARGET}, {error => \my $err});
+    die("Failed to create directory '$cfg{TARGET}'\n") if (@$err);
+  }
+
+  # Get sure BUILDUSER can write to TARGET
+  system ('chown', '-R', $cfg{BUILDUSER}, $cfg{TARGET});
+  die("Failed to change owner of '$cfg{TARGET}' to build user\n") if ($?);
+
+  # If enabled in makepkg.conf, create BUILDDIR and SRCDEST and change owner
+  # to BUILDUSER.
+  foreach my $makepkgdir ('BUILDDIR', 'SRCDEST') {
+    if ($makepkgconf->{$makepkgdir}) {
+      my $dir = $makepkgconf->{$makepkgdir};
+      make_path($dir, {error => \my $err});
+      die("Failed to create directory '$dir'\n") if (@$err);
+      system('chown', '-R', $cfg{BUILDUSER}, $dir);
+      die("Failed to change owner of '$dir' to build user\n") if ($?);
+    }
+  }
+
+  # Get sure gpg-agent is running if we create signed packages
+  HandleGPGAgent(\@builduserinfo) if ($makepkgconf->{BUILDENV}->{sign});
+
+  # Parsing of PKGBUILD headers may take some time... Print info message.
+  InfoMsg("Parsing PKGBUILD header data...");
+
+  # Read PKGBUILDs and preprocess header information
+  my %pkgfilename;
+  my %dbgfilename;
+  my @buildorder;
+  foreach my $pkgbuildpath (@{$cfg{list}}) {
+    next if ($pkgbuildpath =~ /(^#|^\s*$)/);
+    die("Directory missing: $pkgbuildpath\n") unless (-d $pkgbuildpath);
+
+    # Parse the PKGBUILD file
+    my $pkgheader = ParsePKGBUILD($pkgbuildpath, $cfg{BUILDUSER});
+
+    # Check for required header entries
+    foreach my $tocheck ('pkgname', 'arch') {
+      die("Missing '$tocheck' in '$pkgbuildpath/PKGBUILD'\n")
+        if (@{$pkgheader->{$tocheck}} == 0);
     }
 
-    # Always get sure the package DB is up-to-date
-    InfoMsg('Synchronizing package lists...');
-    system 'pacman', '-Sy';
-    die "pacman failed!\n" if ($CHILD_ERROR);
-
-    my $chroot_root;
-    my @pacmancmd;
-    push @pacmancmd, 'pacman';
-    $chroot_root = q();
-
-    if ( $opts{c} ) {
-
-        # Check if devtools package is already installed
-        InfoMsg('Checking if devtools package is already installed');
-        system 'pacman', '-Qi', 'devtools';
-        if ( ($CHILD_ERROR) != 0 ) {
-            InfoMsg('devtools package is not installed. Installing...');
-            system 'pacman', '-S', 'devtools', '--noconfirm';
-            die "pacman failed!\n" if ($CHILD_ERROR);
-        }
-
-        my $chroot_rel_path = 'build';
-        my $chroot_abs_path = File::Spec->rel2abs($chroot_rel_path);
-        InfoMsg("Checking if build folder $chroot_abs_path exists.");
-        if ( !-d $chroot_abs_path ) {
-            InfoMsg("Creating directory $chroot_abs_path");
-            make_path $chroot_abs_path
-              or croak "Failed to create folder $chroot_abs_path";
-        }
-
-        $chroot_root = catfile( $chroot_abs_path, 'root' );
-        InfoMsg('Checking if chroot is already installed');
-        if ( !-d $chroot_root ) {
-            InfoMsg('Installing chroot environment...');
-            system 'mkarchroot', $chroot_root, 'base-devel';
-            croak "mkarchroot failed!\n" if ($CHILD_ERROR);
-        }
-
-        unshift @pacmancmd, $chroot_root;
-        unshift @pacmancmd, 'arch-nspawn';
+    # Continue if the PKGBUILD can't be built on current architecture.
+    unless($pkgheader->{arch}->[0] eq 'any' ||
+           grep {$_ eq $makepkgconf->{CARCH}} @{$pkgheader->{arch}}) {
+      WarnMsg("Skipping $pkgbuildpath. Architecture not supported.");
+      next;
     }
 
-    # If no upgrade for over 24 hours, then force upgrade!
-    if ( time() - GetLastSystemUpgradeTime($chroot_root) > ONE_DAY ) {
-        InfoMsg('Upgrading build system...');
-        system @pacmancmd, '-Su', '--noconfirm';
-        die "pacman failed!\n" if ($CHILD_ERROR);
+    my $dependsref = [@{$pkgheader->{depends}},
+                      @{$pkgheader->{makedepends}}];
+    push(@$dependsref, @{$pkgheader->{checkdepends}})
+      if ($makepkgconf->{BUILDENV}->{check});
+    foreach my $pkgname (@{$pkgheader->{pkgname}}) {
+      # Get expected package filenames
+      my $suffix = "$pkgheader->{pkgver}->{$pkgname}-"
+        . ($pkgheader->{pkgarch}->{$pkgname} || $makepkgconf->{CARCH})
+        . $makepkgconf->{PKGEXT};
+      my $filename  = "$pkgname-$suffix";
+      my $debugname = "$pkgname-debug-$suffix";
+
+      # Remember package filename and dependencies for later access
+      $pkgfilename{$pkgname} = $filename;
+      $dbgfilename{$pkgname} = $debugname;
+      # Also store the same info for the provided packages
+      foreach my $provided (@{$pkgheader->{provides}}) {
+        $pkgfilename{$provided} = $filename;
+      }
     }
 
-    # Read config file(s)
-    my %cfg;
-    ParseConfig( 'repo-make.conf', \%cfg, 1 );
-    die "Missing REPONAME in repomake.conf\n" if !defined $cfg{REPONAME};
-    $cfg{TARGET} = 'repo';
-    if ( -s 'repo-make-custom.conf' ) {
-        ParseConfig( 'repo-make-custom.conf', \%cfg, 1 );
-    }
-    $cfg{BUILDUSER} = 'build';
-    if ( -s '/etc/repo-make.conf' ) {
-        ParseConfig( '/etc/repo-make.conf', \%cfg );
-    }
+    # Remember the data, we need for the build process
+    push(@buildorder, [$pkgbuildpath, $pkgheader->{pkgname}, $dependsref]);
+  }
 
-    # Command line parameter "-t" overrides TARGET
-    if ( $opts{t} ) {
-        $cfg{TARGET} = $opts{t};
-    }
-
-    # Read makepkg.conf
-    my $makepkgconf = ReadMakepkgConf();
-
-    # Replace "$CARCH" in TARGET
-    $cfg{TARGET} =~ s/\$CARCH/$makepkgconf->{CARCH}/;
-
-    # Export "PKGDEST" to make makepkg write packages directly to TARGET
-    local $ENV{PKGDEST} = rel2abs( $cfg{TARGET} );
-
-    # Check for BUILDUSER. If not there, create it.
-    my @builduserinfo;
-    if ( !(@builduserinfo = getpwnam $cfg{BUILDUSER}) ) {
-        InfoMsg("Creating user '$cfg{BUILDUSER}'");
-        system 'useradd', '-m', $cfg{BUILDUSER};
-        die "Failed to create user '$cfg{BUILDUSER}'\n" if ($CHILD_ERROR);
-        @builduserinfo = getpwnam $cfg{BUILDUSER} or croak $OS_ERROR;
-    }
-
-    # Check if BUILDUSER is able to reach our stuff.
-    system 'su', $cfg{BUILDUSER}, '-c', 'cat repo-make.conf > /dev/null';
-    die "User '$cfg{BUILDUSER}' is not allowed to access build data\n"
-      if ($CHILD_ERROR);
-
-    # Check for target directory. If missing, try to create it.
-    if ( !-d $cfg{TARGET} ) {
-        make_path( $cfg{TARGET}, { error => \my $err } );
-        die "Failed to create directory '$cfg{TARGET}'\n" if ( @{$err} );
-    }
-
-    # Get sure BUILDUSER can write to TARGET
-    system 'chown', '-R', $cfg{BUILDUSER}, $cfg{TARGET};
-    die "Failed to change owner of '$cfg{TARGET}' to build user\n"
-      if ($CHILD_ERROR);
-
-    # If enabled in makepkg.conf, create BUILDDIR and SRCDEST and change owner
-    # to BUILDUSER.
-    foreach my $makepkgdir ( 'BUILDDIR', 'SRCDEST' ) {
-        if ( $makepkgconf->{$makepkgdir} ) {
-            my $dir = $makepkgconf->{$makepkgdir};
-            make_path( $dir, { error => \my $err } );
-            die "Failed to create directory '$dir'\n" if ( @{$err} );
-            system 'chown', '-R', $cfg{BUILDUSER}, $dir;
-            die "Failed to change owner of '$dir' to build user\n"
-              if ($CHILD_ERROR);
-        }
-    }
-
-    # Get sure gpg-agent is running if we create signed packages
-    if ( $makepkgconf->{BUILDENV}->{sign} ) {
-        HandleGPGAgent( \@builduserinfo );
-    }
-
-    # Parsing of PKGBUILD headers may take some time... Print info message.
-    InfoMsg('Parsing PKGBUILD header data...');
-
-    # Read PKGBUILDs and preprocess header information
-    my %pkgfilename;
-    my %dbgfilename;
-    my @buildorder;
-    foreach my $pkgbuildpath ( @{ $cfg{list} } ) {
-        next if ( $pkgbuildpath =~ /(^#|^\s*$)/ );
-        if ( !-d $pkgbuildpath ) {
-            die "Directory missing: $pkgbuildpath\n";
-        }
-
-        # Parse the PKGBUILD file
-        my $pkgheader = ParsePKGBUILD( $pkgbuildpath, $cfg{BUILDUSER} );
-
-        # Check for required header entries
-        foreach my $tocheck ( 'pkgname', 'arch' ) {
-            if ( @{ $pkgheader->{$tocheck} } == 0 ) {
-                die "Missing '$tocheck' in '$pkgbuildpath/PKGBUILD'\n";
-            }
-        }
-
-        # Continue if the PKGBUILD can't be built on current architecture.
-        my $archslength = 0;
-        if ($pkgheader->{arch}->[0] eq 'any') {
-            ++$archslength;
-        }
-        else {
-            my @archs = grep {$makepkgconf->{CARCH} eq $ARG} @{$pkgheader->{arch}};
-            $archslength= @archs;
-        }
-
-        if ($archslength == 0)
-        {
-            WarnMsg("Skipping $pkgbuildpath. Architecture not supported.");
-            next;
-        }
-
-        my $dependsref =
-          [ @{ $pkgheader->{depends} }, @{ $pkgheader->{makedepends} } ];
-        if ( $makepkgconf->{BUILDENV}->{check} ) {
-            push @{$dependsref}, @{ $pkgheader->{checkdepends} };
-        }
-        foreach my $pkgname ( @{ $pkgheader->{pkgname} } ) {
-
-            # Get expected package filenames
-            my $suffix =
-                "$pkgheader->{pkgver}->{$pkgname}-"
-              . ( $pkgheader->{pkgarch}->{$pkgname} || $makepkgconf->{CARCH} )
-              . $makepkgconf->{PKGEXT};
-            my $filename  = "$pkgname-$suffix";
-            my $debugname = "$pkgname-debug-$suffix";
-
-            # Remember package filename and dependencies for later access
-            $pkgfilename{$pkgname} = $filename;
-            $dbgfilename{$pkgname} = $debugname;
-
-            # Also store the same info for the provided packages
-            foreach my $provided ( @{ $pkgheader->{provides} } ) {
-                $pkgfilename{$provided} = $filename;
-            }
-        }
-
-        # Remember the data, we need for the build process
-        push @buildorder, [ $pkgbuildpath, $pkgheader->{pkgname}, $dependsref ];
-    }
-
-    # Now run over all packages again and build missing packages
+  # Now run over all packages again and build missing packages
   PACKAGE: foreach my $packagedata (@buildorder) {
-        my ( $pkgbuildpath, $pkgnameref, $pkgdepends ) = @{$packagedata};
+    my ($pkgbuildpath, $pkgnameref, $pkgdepends) = @$packagedata;
 
-        # Still something to build?
-        my $packages_built = 0;
-        foreach my $pkgname ( @{$pkgnameref} ) {
-            if ( -s "$cfg{TARGET}/$pkgfilename{$pkgname}" ) {
-                $packages_built++;
-            }
-        }
-        next PACKAGE if ( $packages_built == @{$pkgnameref} );
+    # Still something to build?
+    my $packages_built = 0;
+    foreach my $pkgname (@$pkgnameref) {
+      $packages_built++ if (-s "$cfg{TARGET}/$pkgfilename{$pkgname}");
+    }
+    next PACKAGE if ($packages_built == @$pkgnameref);
 
-        # Remove orphan dependencies, not needed for this package (verify mode)
-        if ( $opts{V} ) {
-            RemoveOrphanDeps($pkgdepends);
-        }
+    # Remove orphan dependencies, not needed for this package (verify mode)
+    RemoveOrphanDeps($pkgdepends) if ($opts{V});
 
-        # Get sure that all pre-existing packages are out of our way
-        foreach my $pkgname ( @{$pkgnameref} ) {
-            if ( -s "$cfg{TARGET}/$pkgfilename{$pkgname}" ) {
-                unlink "$cfg{TARGET}/$pkgfilename{$pkgname}" or croak $OS_ERROR;
-            }
-            if ( -s "$cfg{TARGET}/$dbgfilename{$pkgname}" ) {
-                unlink "$cfg{TARGET}/$dbgfilename{$pkgname}" or croak $OS_ERROR;
-            }
-        }
-
-        # If no BUILDDIR and SRCDEST configured, then change owner of
-        # package path to BUILDUSER
-        if ( !$makepkgconf->{BUILDDIR} && !$makepkgconf->{SRCDEST} ) {
-            system 'chown', '-R', $cfg{BUILDUSER}, $pkgbuildpath;
-            die "Failed to change owner of '$pkgbuildpath' to build user\n"
-              if ($CHILD_ERROR);
-        }
-
-        InfoMsg("Resolving dependencies for '$pkgbuildpath'...");
-
-        # Separate dependencies into "ours" and "system repository"
-        my @repodeps;
-        my @ourdeps;
-        foreach my $depend ( @{$pkgdepends} ) {
-            if ( defined $pkgfilename{$depend} ) {
-                push @ourdeps, $depend;
-            }
-            else {
-                push @repodeps, $depend;
-            }
-        }
-
-        # Collect "dependencies of dependencies" for our packages
-        my @depstocheck;
-        my %depchecked;
-        while ( @ourdeps != @depstocheck ) {
-            @depstocheck = @ourdeps;
-            foreach my $depend (@depstocheck) {
-                next if ( defined $depchecked{$depend} );
-                my $depdepends =
-                  GetPKGDeps("$cfg{TARGET}/$pkgfilename{$depend}");
-                foreach my $depdepend ( @{$depdepends} ) {
-                    if ( defined $pkgfilename{$depdepend} ) {
-                        unshift @ourdeps, $depdepend;
-                    }
-                }
-                $depchecked{$depend} = 1;
-            }
-        }
-
-        # Get filenames for our dependencies
-        foreach (@ourdeps) {
-          $_ = $pkgfilename{$_};
-        }
-
-        # Get sure that we don't have duplicates in the list of our dependencies
-        my %ourdeps_hash = map { $_ => 1 } @ourdeps;
-        @ourdeps = keys %ourdeps_hash;
-
-        # Install dependencies
-        if ( @ourdeps + @repodeps > 0 ) {
-            InfoMsg('Installing missing dependencies...');
-        }
-        if ( @ourdeps > 0 ) {
-            my $oldcwd = getcwd();
-            chdir $cfg{TARGET};
-            AutoPacman( '-U', '--needed', '--asdeps', @ourdeps )
-              or die "pacman failed!\n";
-            chdir $oldcwd;
-        }
-        if ( @repodeps > 0 ) {
-            AutoPacman( '-S', '--needed', '--asdeps', @repodeps )
-              or die "pacman failed!\n";
-        }
-
-        # Build package in context of BUILDUSER
-        my $pid = fork();
-        if ( !defined $pid ) {
-            croak 'fork failed';
-        }
-        if ( $pid == 0 ) {
-            setgid( $builduserinfo[$PW_GID] ) or croak 'setgid failed';
-            setuid( $builduserinfo[$PW_UID] ) or croak 'setuid failed';
-            local $ENV{HOME} = $builduserinfo[$PW_DIR];
-            chdir $pkgbuildpath;
-            exec 'makepkg', '-fc';
-        }
-
-     # Wait for the forked process, we created above, and check for build errors
-        local $SIG{INT}  = 'IGNORE';
-        local $SIG{QUIT} = 'IGNORE';
-        waitpid $pid, 0;
-        local $SIG{INT}  = 'DEFAULT';
-        local $SIG{QUIT} = 'DEFAULT';
-        die "makepkg failed for '$pkgbuildpath'!\n" if ($CHILD_ERROR);
-
-        # Check if all packages, we expected, have been created
-        foreach my $pkgname ( @{$pkgnameref} ) {
-            my $filename = $pkgfilename{$pkgname};
-            my $pkgpath  = "$cfg{TARGET}/$filename";
-            if ( !-s $pkgpath ) {
-                die "Missing package: $filename\n";
-            }
-
-            # If configured, then run CHECKSCRIPT as BUILDUSER.
-            if ( $cfg{CHECKSCRIPT} ) {
-                system 'su', $cfg{BUILDUSER}, '-c',
-                  "$cfg{CHECKSCRIPT} '$pkgpath'";
-                if ($CHILD_ERROR) {
-                    unlink $pkgpath;
-                    die
-"Checkscript returned with error state for '$filename'!\n";
-                }
-            }
-
-            # Check for signature
-            if ( $makepkgconf->{BUILDENV}->{sign} && !-s "$pkgpath.sig" ) {
-                unlink $pkgpath;
-                die "Signature missing for '$filename'!\n";
-            }
-        }
+    # Get sure that all pre-existing packages are out of our way
+    foreach my $pkgname (@$pkgnameref) {
+      if (-s "$cfg{TARGET}/$pkgfilename{$pkgname}") {
+        unlink("$cfg{TARGET}/$pkgfilename{$pkgname}") or die($!);
+      }
+      if (-s "$cfg{TARGET}/$dbgfilename{$pkgname}") {
+        unlink("$cfg{TARGET}/$dbgfilename{$pkgname}") or die($!);
+      }
     }
 
-    # Final cleanup of orphan dependencies (verify mode)
-    if ( $opts{V} ) {
-        RemoveOrphanDeps();
+    # If no BUILDDIR and SRCDEST configured, then change owner of
+    # package path to BUILDUSER
+    unless ($makepkgconf->{BUILDDIR} &&
+            $makepkgconf->{SRCDEST}) {
+      system ('chown', '-R', $cfg{BUILDUSER}, $pkgbuildpath);
+      die("Failed to change owner of '$pkgbuildpath' to build user\n") if ($?);
     }
 
-    # Create hash array of valid package filenames.
-    # All "pkgfilename"'s are valid. Add "dbgfilename"'s if package exists.
-    my %packages = reverse %pkgfilename;
-    while ( my ( $pkgname, $filename ) = each %dbgfilename ) {
-        if ( -s "$cfg{TARGET}/$filename" ) {
-            $packages{$filename} = $pkgname;
+    InfoMsg("Resolving dependencies for '$pkgbuildpath'...");
+
+    # Separate dependencies into "ours" and "system repository"
+    my @repodeps;
+    my @ourdeps;
+    foreach my $depend (@$pkgdepends) {
+      if (defined($pkgfilename{$depend})) {
+        push(@ourdeps, $depend);
+      }
+      else {
+        push(@repodeps, $depend);
+      }
+    }
+
+    # Collect "dependencies of dependencies" for our packages
+    my @depstocheck;
+    my %depchecked;
+    do {
+      @depstocheck = @ourdeps;
+      foreach my $depend (@depstocheck) {
+        next if (defined($depchecked{$depend}));
+        my $depdepends = GetPKGDeps("$cfg{TARGET}/$pkgfilename{$depend}");
+        foreach my $depdepend (@$depdepends) {
+          if (defined($pkgfilename{$depdepend})) {
+            unshift(@ourdeps, $depdepend);
+          }
         }
+        $depchecked{$depend} = 1;
+      }
+    } while (@ourdeps != @depstocheck);
+
+    # Get filenames for our dependencies
+    $_ = $pkgfilename{$_} foreach (@ourdeps);
+
+    # Get sure that we don't have duplicates in the list of our dependencies
+    my %ourdeps_hash = map {$_ => 1} @ourdeps;
+    @ourdeps = keys(%ourdeps_hash);
+
+    # Install dependencies
+    InfoMsg('Installing missing dependencies...') if (@ourdeps + @repodeps > 0);
+    if (@ourdeps > 0) {
+      my $oldcwd = getcwd();
+      chdir($cfg{TARGET});
+      AutoPacman('-U', '--needed', '--asdeps', @ourdeps)
+        or die("pacman failed!\n");
+      chdir($oldcwd);
+    }
+    if (@repodeps > 0) {
+      AutoPacman('-S', '--needed', '--asdeps', @repodeps)
+        or die("pacman failed!\n");
     }
 
-    # Run cleanup on the target directory
-    opendir my $DH, $cfg{TARGET} or croak $OS_ERROR;
-    while ( my $file = readdir $DH ) {
-        next if ( $file =~ /^\./ );
-        next if ( $file !~ /\Q$makepkgconf->{PKGEXT}\E$/ );
-        if ( !defined $packages{$file} ) {
-            unlink "$cfg{TARGET}/$file" or die "Failed to delete: $file\n";
-            unlink "$cfg{TARGET}/$file.sig";
+    # Build package in context of BUILDUSER
+    my $pid = fork();
+    die('fork failed') unless(defined($pid));
+    if ($pid == 0) {
+      setgid($builduserinfo[PW_GID]) or die('setgid failed');
+      setuid($builduserinfo[PW_UID]) or die('setuid failed');
+      $ENV{HOME} = $builduserinfo[PW_DIR];
+      chdir($pkgbuildpath);
+      exec('makepkg', '-fc');
+    }
+
+    # Wait for the forked process, we created above, and check for build errors
+    $SIG{INT} = 'IGNORE';
+    $SIG{QUIT} = 'IGNORE';
+    waitpid($pid, 0);
+    $SIG{INT} = 'DEFAULT';
+    $SIG{QUIT} = 'DEFAULT';
+    die("makepkg failed for '$pkgbuildpath'!\n") if ($?);
+
+    # Check if all packages, we expected, have been created
+    foreach my $pkgname (@$pkgnameref) {
+      my $filename = $pkgfilename{$pkgname};
+      my $pkgpath = "$cfg{TARGET}/$filename";
+      die("Missing package: $filename\n") unless (-s $pkgpath);
+
+      # If configured, then run CHECKSCRIPT as BUILDUSER.
+      if ($cfg{CHECKSCRIPT}) {
+        system('su', $cfg{BUILDUSER}, '-c', "$cfg{CHECKSCRIPT} '$pkgpath'");
+        if ($?) {
+          unlink($pkgpath);
+          die("Checkscript returned with error state for '$filename'!\n");
         }
+      }
+
+      # Check for signature
+      if ($makepkgconf->{BUILDENV}->{sign} && ! -s "$pkgpath.sig") {
+        unlink($pkgpath);
+        die("Signature missing for '$filename'!\n");
+      }
     }
-    closedir $DH;
+  }
 
-    # Run cleanup on the DB file.
-    my $dbpath = "$cfg{TARGET}/$cfg{REPONAME}.db.tar.gz";
-    if ( -s $dbpath ) {
-        my @dirstoremove;
-        my %dirfiles;
-        my $tar   = Archive::Tar->new;
-        my @files = $tar->read($dbpath);
-        foreach my $tarfile (@files) {
+  # Final cleanup of orphan dependencies (verify mode)
+  RemoveOrphanDeps() if ($opts{V});
 
-            # Split dirname and filename part
-            my ( $dirname, $filename ) = $tarfile->{name} =~ /([^\/]+)\/?(.*)/;
+  # Create hash array of valid package filenames.
+  # All "pkgfilename"'s are valid. Add "dbgfilename"'s if package exists.
+  my %packages = reverse(%pkgfilename);
+  while (my($pkgname, $filename) = each(%dbgfilename)) {
+    $packages{$filename} = $pkgname if (-s "$cfg{TARGET}/$filename");
+  }
 
-           # Store list of files in directory for the case, we want to delete it
-            if ( !$dirfiles{$dirname} ) {
-                $dirfiles{$dirname} = [];
-            }
-            push @{ $dirfiles{$dirname} }, $tarfile->{name};
+  # Run cleanup on the target directory
+  opendir(my $DH, $cfg{TARGET}) or die($!);
+  while (my $file = readdir($DH)) {
+    next if ($file =~ /^\./);
+    next if ($file !~ /\Q$makepkgconf->{PKGEXT}\E$/);
+    unless (defined($packages{$file})) {
+      unlink("$cfg{TARGET}/$file") or die("Failed to delete: $file\n");
+      unlink("$cfg{TARGET}/$file.sig");
+    }
+  }
+  closedir($DH);
 
-       # Only continue for the file "desc" and try to find full package filename
-            next if ( $filename ne 'desc' );
-            my $pkgfilename =
-              "$dirname-$makepkgconf->{CARCH}$makepkgconf->{PKGEXT}";
-            if ( !$packages{$pkgfilename} ) {
-                $pkgfilename = "$dirname-any$makepkgconf->{PKGEXT}";
-            }
+  # Run cleanup on the DB file.
+  my $dbpath = "$cfg{TARGET}/$cfg{REPONAME}.db.tar.gz";
+  if (-s $dbpath) {
+    my @dirstoremove;
+    my %dirfiles;
+    my $tar = Archive::Tar->new;
+    my @files = $tar->read($dbpath);
+    foreach my $tarfile (@files) {
+      # Split dirname and filename part
+      my ($dirname, $filename) = $tarfile->{name} =~ /([^\/]+)\/?(.*)/;
 
-         # If the package file doesn't exist or is outdated, then remove from DB
-            if ( !$packages{$pkgfilename}
-                || ( stat "$cfg{TARGET}/$pkgfilename" )[9] > $tarfile->{mtime} )
-            {
-                push @dirstoremove, $dirname;
-            }
+      # Store list of files in directory for the case, we want to delete it
+      $dirfiles{$dirname} = [] unless($dirfiles{$dirname});
+      push(@{$dirfiles{$dirname}}, $tarfile->{name});
 
-       # If Package exists (and is up to date) then remove from list of packages
-            elsif ( $packages{$pkgfilename} ) {
-                delete $packages{$pkgfilename};
-            }
-        }
+      # Only continue for the file "desc" and try to find full package filename
+      next if ($filename ne 'desc');
+      my $pkgfilename = "$dirname-$makepkgconf->{CARCH}$makepkgconf->{PKGEXT}";
+      unless ($packages{$pkgfilename}) {
+        $pkgfilename = "$dirname-any$makepkgconf->{PKGEXT}";
+      }
 
-        # Process removals and write updated DB file
-        if ( @dirstoremove > 0 ) {
-            foreach my $dirname (@dirstoremove) {
-                $tar->remove( @{ $dirfiles{$dirname} } );
-            }
-            $tar->write( $dbpath, COMPRESS_GZIP );
-            my $shortdbpath = "$cfg{TARGET}/$cfg{REPONAME}.db";
-            unlink $shortdbpath;
-            symlink "$cfg{REPONAME}.db.tar.gz", $shortdbpath
-              or copy( $dbpath, $shortdbpath )
-              or die "Failed to write $shortdbpath\n";
-        }
+      # If the package file doesn't exist or is outdated, then remove from DB
+      if (!$packages{$pkgfilename} ||
+          (stat("$cfg{TARGET}/$pkgfilename"))[9] > $tarfile->{mtime}) {
+        push(@dirstoremove, $dirname);
+      }
+      # If Package exists (and is up to date) then remove from list of packages
+      elsif ($packages{$pkgfilename}) {
+        delete($packages{$pkgfilename});
+      }
     }
 
-    # Run "repo-add" if needed
-    if ( keys(%packages) > 0 ) {
-        my $oldcwd = getcwd();
-        chdir $cfg{TARGET};
-        unlink "$cfg{REPONAME}.db";
-        system 'repo-add', "$cfg{REPONAME}.db.tar.gz", keys %packages;
-        die "repo-add failed\n" if ($CHILD_ERROR);
-        chdir $oldcwd;
+    # Process removals and write updated DB file
+    if (@dirstoremove > 0) {
+      foreach my $dirname (@dirstoremove) {
+        $tar->remove(@{$dirfiles{$dirname}});
+      }
+      $tar->write($dbpath, COMPRESS_GZIP);
+      my $shortdbpath = "$cfg{TARGET}/$cfg{REPONAME}.db";
+      unlink($shortdbpath);
+      symlink("$cfg{REPONAME}.db.tar.gz", $shortdbpath)
+        or copy($dbpath, $shortdbpath) or die("Failed to write $shortdbpath\n");
     }
+  }
+
+  # Run "repo-add" if needed
+  if (keys(%packages) > 0) {
+    my $oldcwd = getcwd();
+    chdir($cfg{TARGET});
+    unlink("$cfg{REPONAME}.db");
+    system('repo-add', "$cfg{REPONAME}.db.tar.gz", keys(%packages));
+    die("repo-add failed\n") if ($?);
+    chdir($oldcwd);
+  }
 }
 
 sub VERSION_MESSAGE {
-    print "$PROGNAME $VERSION\n";
-    exit 0;
+  print "$PROGNAME $VERSION\n";
+  exit(0);
 }
 
 sub HELP_MESSAGE {
-
-    # Print out the built-in POD documentation in case of --help parameter
-    Pod::PlainText->new( sentence => 0 )->parse_from_file($PROGRAM_NAME);
-    exit 0;
+  # Print out the built-in POD documentation in case of --help parameter
+  Pod::PlainText->new(sentence => 0)->parse_from_file($0);
+  exit(0);
 }
 
 sub InfoMsg {
-    print {*STDERR} color('bold green'), "==> $PROGNAME: ", color('reset'),
-      color('bold'), $_[0], color('reset'), "\n";
+  print STDERR color('bold green'), "==> $PROGNAME: ", color('reset'),
+               color('bold'), $_[0], color('reset'), "\n";
 }
 
 sub WarnMsg {
-    print {*STDERR} color('bold yellow'), "==> $PROGNAME: WARNING: ",
-      color('reset'),
-      color('bold'), $_[0], color('reset'), "\n";
+  print STDERR color('bold yellow'), "==> $PROGNAME: WARNING: ", color('reset'),
+               color('bold'), $_[0], color('reset'), "\n";
 }
 
 # Returns timestamp of last full system upgrade by parsing pacman.log
 sub GetLastSystemUpgradeTime {
-    my $chroot_root = shift;
+  # Default path to pacman.log
+  my $logpath = '/var/log/pacman.log';
 
-    # Default path to pacman.log
-    my $logpath = '/var/log/pacman.log';
-
-    # Try to read alternative path from pacman.conf
-    if ( open my $fhconf, '<', catfile( $chroot_root, '/etc/pacman.conf' ) ) {
-        if ( my ($logfilecfg) = grep( /^\s*LogFile/, <$fhconf> ) ) {
-            ($logpath) = $logfilecfg =~ /.*?=\s*(.*)/;
-        }
-        close $fhconf;
+  # Try to read alternative path from pacman.conf
+  if (open(my $fhconf, '<', '/etc/pacman.conf')) {
+    if (my ($logfilecfg) = grep(/^\s*LogFile/, <$fhconf>)) {
+      ($logpath) = $logfilecfg =~ /.*?=\s*(.*)/;
     }
+    close($fhconf);
+  }
 
-    $logpath = catfile( $chroot_root, $logpath );
-
-    # Read pacman.log backwards
-    my $pid = open my $fh, q{-|}, q{tac}, $logpath or die "Failed to execute 'tac': $OS_ERROR\n";
-    while ( my $line = <$fh> ) {
-        if ( my ($time) = $line =~ /^\[([^\]]+)\] \[PACMAN\] starting full system upgrade$/ )
-        {
-            my ( $year, $month, $day, $hour, $minute ) = split /[ :-]/, $time;
-            return mktime( 0, $minute, $hour, $day, $month - 1, $year - 1900 );
-        }
+  # Read pacman.log backwards
+  my $pid = open(my $fh, '-|', 'tac', $logpath)
+    or die("Failed to execute 'tac': $!\n");
+  while (my $line = <$fh>) {
+    if (my ($time) = $line =~
+        /^\[([^\]]+)\] \[PACMAN\] starting full system upgrade$/) {
+      my ($year, $month, $day, $hour, $minute) = split(/[ :-]/, $time);
+      return mktime(0, $minute, $hour, $day, $month - 1, $year - 1900);
     }
+  }
 
-    # Wait for "tac" to terminate and check exit code
-    waitpid $pid, 0;
-    die "Failed to read pacman.log\n" if ($CHILD_ERROR);
-    close $fh;
+  # Wait for "tac" to terminate and check exit code
+  waitpid($pid, 0);
+  die("Failed to read pacman.log\n") if ($?);
+  close($fh);
 }
 
 sub HandleGPGAgent {
-    my ($aUserinfo) = @ARG;
+  my ($aUserinfo) = @_;
 
-    return if ( !-x '/usr/bin/gpg-agent' );
+  return unless (-x '/usr/bin/gpg-agent');
 
-    # Make our builduser the owner of the tty, we run at.
-    die "STDIN is no TTY!\n" if ( !-t STDIN );
-    chown $aUserinfo->[$PW_UID], $aUserinfo->[$PW_GID], *STDIN
-      or die "Failed to chown tty to build user: $OS_ERROR\n";
+  # Make our builduser the owner of the tty, we run at.
+  die("STDIN is no TTY!\n") unless(-t STDIN);
+  chown($aUserinfo->[PW_UID], $aUserinfo->[PW_GID], *STDIN)
+    or die("Failed to chown tty to build user: $!\n");
 
-    # Check if agent is already running
-    ReadGPGAgentInfo($aUserinfo);
-    system 'su', $aUserinfo->[$PW_NAME], '-c', 'gpg-agent 2> /dev/null';
-    return if ( !$CHILD_ERROR );
+  # Check if agent is already running
+  ReadGPGAgentInfo($aUserinfo);
+  system('su', $aUserinfo->[PW_NAME], '-c', 'gpg-agent 2> /dev/null');
+  return unless ($?);
 
-    # Start daemon and read info file
-    system 'su', $aUserinfo->[$PW_NAME], '-c',
-'gpg-agent --daemon --write-env-file --default-cache-ttl 7200 --pinentry-program /usr/bin/pinentry-curses > /dev/null';
-    die "gpg-agent startup failed\n" if ($CHILD_ERROR);
-    ReadGPGAgentInfo($aUserinfo);
+  # Start daemon and read info file
+  system('su', $aUserinfo->[PW_NAME], '-c',
+         'gpg-agent --daemon --write-env-file --default-cache-ttl 7200 --pinentry-program /usr/bin/pinentry-curses > /dev/null');
+  die("gpg-agent startup failed\n") if ($?);
+  ReadGPGAgentInfo($aUserinfo);
 }
 
 # Legacy GnuPG support (< 2.1)
 sub ReadGPGAgentInfo {
-    my ($aUserinfo) = @ARG;
-    open my $fh, '<', "$aUserinfo->[$PW_DIR]/.gpg-agent-info" or return;
-    ( my $info = <$fh> ) =~ s/^[^=]+=//;
-    close $fh;
-    local $ENV{GPG_AGENT_INFO} = $info;
+  my ($aUserinfo) = @_;
+  open(my $fh, '<', "$aUserinfo->[PW_DIR]/.gpg-agent-info") or return;
+  (my $info = <$fh>) =~ s/^[^=]+=//;
+  close($fh);
+  $ENV{GPG_AGENT_INFO} = $info;
 }
 
 # Removes orphan dependencies.
 # Optionally a reference to a list of packages to keep can be passed
 sub RemoveOrphanDeps {
-    my ($aPkgsToKeep) = @ARG;
+  my ($aPkgsToKeep) = @_;
 
-    # Get list of orphans
-    open my $fhlist, q{-|}, q{pacman}, q{-Qdtq}
-      or die "Can't start pacman: $OS_ERROR\n";
-    chomp( my @list = <$fhlist> );
-    close $fhlist;
-    return if ( @list == 0 );
+  # Get list of orphans
+  open(my $fhlist, '-|', 'pacman', '-Qdtq') or die("Can't start pacman: $!\n");
+  chomp(my @list = <$fhlist>);
+  close($fhlist);
+  return if (@list == 0);
 
-    # Get hash array with packages to keep
-    my %keeppkg;
-    if ($aPkgsToKeep) {
-        foreach my $pkgname ( @{$aPkgsToKeep} ) {
-            open my $fhout, q{-|}, q{pacman}, q{-Qsq},
-              q{^} . quotemeta($pkgname) . q{$}
-              or die "Can't start pacman: $OS_ERROR\n";
-            my @orig_pkgnames = <$fhout>;
-            close $fhout;
-            if (@orig_pkgnames) {
-                chomp @orig_pkgnames;
-                foreach (@orig_pkgnames) {
-                    $keeppkg{$_} = 1;
-                }
-            }
-        }
+  # Get hash array with packages to keep
+  my %keeppkg;
+  if ($aPkgsToKeep) {
+    foreach my $pkgname (@$aPkgsToKeep) {
+      open(my $fhout, '-|', 'pacman', '-Qsq', '^'.quotemeta($pkgname).'$')
+        or die("Can't start pacman: $!\n");
+      my @orig_pkgnames = <$fhout>;
+      close($fhout);
+      if (@orig_pkgnames) {
+        chomp(@orig_pkgnames);
+        $keeppkg{$_} = 1 foreach(@orig_pkgnames);
+      }
     }
+  }
 
-    # Uninstall orphan dependencies, we don't want to keep
-    @list = grep { !$keeppkg{$_} } @list;
-    return if ( @list == 0 );
-    InfoMsg('Uninstalling unrequired dependencies...');
-    system 'pacman', '-Rs', '--noconfirm', @list;
-    if ($CHILD_ERROR) {
-        die "pacman failed\n";
-    }
+  # Uninstall orphan dependencies, we don't want to keep
+  @list = grep {!$keeppkg{$_}} @list;
+  return if (@list == 0);
+  InfoMsg('Uninstalling unrequired dependencies...');
+  system('pacman', '-Rs', '--noconfirm', @list);
+  die("pacman failed\n") if ($?);
 }
 
 sub GetPKGDeps {
-    my ($aPath) = @ARG;
+  my ($aPath) = @_;
 
-    if ( !-s $aPath ) {
-        croak 'Expected package \''
-          . basename($aPath)
-          . "\' not built. Check build order!\n";
+  die("Expected package '".basename($aPath)."' not built. Check build order!\n")
+    unless (-s $aPath);
+
+  state %cache;
+  unless ($cache{$aPath}) {
+    my @deplist;
+    open(my $fhlist, '-|', 'bsdtar', '-xOf', $aPath, '.PKGINFO') or die($!);
+    while(my $line = <$fhlist>) {
+      my ($value) = $line =~ /^depend ?= ?(.+)$/ or next;
+      # Drop anything after the equal sign
+      $value =~ s/[<>=].*//;
+      push(@deplist, $value);
     }
-
-    state %cache;
-    if ( !$cache{$aPath} ) {
-        my @deplist;
-        open my $fhlist, q{-|'}, q{bsdtar}, q{-xOf}, $aPath, '.PKGINFO' or croak $OS_ERROR;
-        while ( my $line = <$fhlist> ) {
-            my ($value) = $line =~ /^depend ?= ?(.+)$/ or next;
-
-            # Drop anything after the equal sign
-            $value =~ s/[<>=].*//;
-            push @deplist, $value ;
-        }
-        $cache{$aPath} = \@deplist;
-        close $fhlist or carp "Closing $fhlist failed: $OS_ERROR";
-    }
-    return $cache{$aPath};
+    $cache{$aPath} = \@deplist;
+  }
+  return $cache{$aPath};
 }
 
 # Subfunction to automate pacman in cases where "--noconfirm" doesn't work
 sub AutoPacman {
-    my @aOptions = @ARG;
+  my @aOptions = @_;
 
-    # Get sure that we have the same output everywhere
-    local $ENV{LC_MESSAGES} = 'C';
+  # Get sure that we have the same output everywhere
+  local $ENV{LC_MESSAGES} = 'C';
 
-    # Open pacman and connect our own STDIN and STDERR
-    my ( $fhin, $fherr );
-    use Symbol 'gensym';
-    $fherr = gensym;
-    my $pid = open3( $fhin, '>&STDOUT', $fherr, 'pacman', @aOptions );
-    $fherr->autoflush(1);
+  # Open pacman and connect our own STDIN and STDERR
+  my($fhin, $fherr);
+  use Symbol 'gensym'; $fherr = gensym;
+  my $pid = open3($fhin, '>&STDOUT', $fherr, 'pacman', @aOptions);
+  $fherr->autoflush(1);
 
-    # Let's chat with pacman ;)
-    while ( sysread $fherr, my $buffer, 1024 ) {
-        print {*STDERR} $buffer;
-
-        # Remove conflicting packages, so we can go on with installation.
-        if ( $buffer =~ /are in conflict.*Remove/ ) {
-            print {*STDERR} "y\n";
-            print {$fhin} "y\n";
-        }
-
-        # All other cases: Just proceed with default.
-        elsif ($buffer =~ /Enter a number \(/
-            || $buffer =~ /\[y\/n\]/i )
-        {
-            print {*STDERR} "\n";
-            print {$fhin} "\n";
-        }
+  # Let's chat with pacman ;)
+  while(sysread($fherr, my $buffer, 1024)) {
+    print STDERR $buffer;
+    # Remove conflicting packages, so we can go on with installation.
+    if ($buffer =~ /are in conflict.*Remove/) {
+      print STDERR "y\n";
+      print $fhin "y\n";
     }
+    # All other cases: Just proceed with default.
+    elsif ($buffer =~ /Enter a number \(/ ||
+           $buffer =~ /\[y\/n\]/i) {
+      print STDERR "\n";
+      print $fhin "\n";
+    }
+  }
 
-    waitpid $pid, 0;
-    return ( $CHILD_ERROR == 0 );
+  waitpid($pid, 0);
+  return($? == 0);
 }
 
 sub ParseConfig {
-    my ( $aPath, $aHashRef, $aListAllowed ) = @ARG;
-    my $mode = 0;
+  my($aPath, $aHashRef, $aListAllowed) = @_;
+  my $mode = 0;
 
-    my @list;
-    open my $FH, q{<}, $aPath or die "Can't open '$aPath'\n";
-    while ( my $line = <$FH> ) {
-        $line =~ s/\s*$//;
-        next if ( $line =~ /^\s*#/ || $line eq q{} );
+  my @list;
+  open(my $FH, '<', $aPath) or die("Can't open '$aPath'\n");
+  while (my $line = <$FH>) {
+    $line =~ s/\s*$//;
+    next if ($line =~ /^\s*#/ || $line eq '');
 
-        if ( my ( $pref, $value ) = $line =~ /^\s*([A-Z_]+)\s*=\s*(.+)/ ) {
-            $aHashRef->{$pref} = $value;
-        }
-        elsif ( $aListAllowed && $line =~ /^[A-Z0-9\/_.-]+$/i ) {
-            push @list, $line;
-        }
-        else {
-            die "Parsing error in '$aPath' on line $INPUT_LINE_NUMBER\n";
-        }
+    if (my ($pref, $value) = $line =~ /^\s*([A-Z_]+)\s*=\s*(.+)/) {
+      $aHashRef->{$pref} = $value;
     }
-
-    close $FH;
-    if ( @list > 0 ) {
-        $aHashRef->{list} = \@list;
+    elsif ($aListAllowed && $line =~ /^[A-Z0-9\/_.-]+$/i) {
+      push(@list, $line);
     }
+    else {
+      die("Parsing error in '$aPath' on line $.\n");
+    }
+  }
+
+  $aHashRef->{list} = \@list if (@list > 0);
 }
 
 # PKGBUILD parser
 sub ParsePKGBUILD {
-    my ( $aPath, $aBuilduser ) = @ARG;
-    my %values;
+  my ($aPath, $aBuilduser) = @_;
+  my %values;
 
-    if ( !-s "$aPath/PKGBUILD" ) {
-        die "PKGBUILD in '$aPath' not found\n";
-    }
+  die("PKGBUILD in '$aPath' not found\n") unless (-s "$aPath/PKGBUILD");
 
-    # Open a bash instance in context of BUILDUSER.
-    open2( my $fhout, my $fhin, 'su', $aBuilduser, '-s', '/usr/bin/bash' );
+  # Open a bash instance in context of BUILDUSER.
+  open2(my $fhout, my $fhin, 'su', $aBuilduser, '-s', '/usr/bin/bash');
 
-    # Preload our shell interpreter instance with a few helper functions
-    print {$fhin} <<'EOT';
+  # Preload our shell interpreter instance with a few helper functions
+  print $fhin <<'EOT';
 epoch=0
 
 get_full_version() {
@@ -755,98 +639,68 @@ get_pkg_arch() {
 }
 EOT
 
-    # Load PKGBUILD
-    print {$fhin} "cd '$aPath'\n";
-    print {$fhin} "source PKGBUILD\n";
+  # Load PKGBUILD
+  print $fhin "cd '$aPath'\n";
+  print $fhin "source PKGBUILD\n";
 
-    # Get global variables
-    my @variables = (
-        'pkgname', 'provides', 'arch', 'depends',
-        'makedepends', 'checkdepends'
-    );
-    print {$fhin} "IFS='\t'\n";
-    foreach (@variables) {
-      print {$fhin} "echo \"$ARG\t\${$_\[*\]}\"\n";
-    }
-    foreach (@variables) {
-        chomp( my $line = <$fhout> );
-        my ( $varname, @values ) = split /\t/, $line;
+  # Get global variables
+  my @variables = ('pkgname', 'provides', 'arch', 'depends', 'makedepends', 'checkdepends');
+  print $fhin "IFS='\t'\n";
+  print $fhin "echo \"$_\t\${$_\[*\]}\"\n" foreach (@variables);
+  foreach (@variables) {
+    chomp(my $line = <$fhout>);
+    my($varname, @values) = split(/\t/, $line);
+    # Drop anything after the equal sign
+    s/[<>=].*// foreach(@values);
+    $values{$varname} = \@values;
+  }
 
-        # Drop anything after the equal sign
-        s/[<>=].*// foreach (@values);
-        $values{$varname} = \@values;
-    }
+  # Get package versions
+  print $fhin "echo \"$_\t\$(get_full_version $_)\"\n" foreach(@{$values{pkgname}});
+  $values{pkgver} = {};
+  foreach (@{$values{pkgname}}) {
+    chomp(my $line = <$fhout>);
+    my ($pkgname, $pkgver) = split(/\t/, $line);
+    $values{pkgver}->{$pkgname} = $pkgver;
+  }
 
-    # Get package versions
-    foreach ( @{ $values{pkgname} } ) {
-        print {$fhin} "echo \"$ARG\t\$(get_full_version $ARG)\"\n";
-    }
-    $values{pkgver} = {};
-    foreach ( @{ $values{pkgname} } ) {
-        chomp( my $line = <$fhout> );
-        my ( $pkgname, $pkgver ) = split /\t/, $line;
-        $values{pkgver}->{$pkgname} = $pkgver;
-    }
+  # Get package architectures
+  print $fhin "echo \"$_\t\$(get_pkg_arch $_)\"\n" foreach(@{$values{pkgname}});
+  $values{pkgarch} = {};
+  foreach (@{$values{pkgname}}) {
+    chomp(my $line = <$fhout>);
+    my ($pkgname, $pkgarch) = split(/\t/, $line);
+    $values{pkgarch}->{$pkgname} = $pkgarch;
+  }
 
-    # Get package architectures
-    foreach ( @{ $values{pkgname} } ) {
-        print {$fhin} "echo \"$ARG\t\$(get_pkg_arch $ARG)\"\n";
-    }
-    $values{pkgarch} = {};
-    foreach ( @{ $values{pkgname} } ) {
-        chomp( my $line = <$fhout> );
-        my ( $pkgname, $pkgarch ) = split /\t/, $line;
-        $values{pkgarch}->{$pkgname} = $pkgarch;
-    }
-
-    close $fhin;
-    return \%values;
+  close($fhin);
+  return \%values;
 }
 
 # makepkg.conf parser
 sub ReadMakepkgConf {
-    open my $FH, '<', '/etc/makepkg.conf' or die "Can't read makepkg.conf\n";
-    my %values;
-    my $buildenv;
-    while ( my $line = <$FH> ) {
-        if ( $line =~ /^CARCH=["']([^"']+)/ ) {
-            $values{CARCH} = $1;
-        }
-        if ( $line =~ /^PKGEXT=["']([^"']+)/ ) {
-            $values{PKGEXT} = $1;
-        }
-        if ( $line =~ /^BUILDDIR=["']?([^"'\n]+)/ ) {
-            $values{BUILDDIR} = $1;
-        }
-        if ( $line =~ /^SRCDEST=["']?([^"'\n]+)/ ) {
-            $values{SRCDEST} = $1;
-        }
-        if ( $line =~ /^BUILDENV=\(([^)]+)/ ) {
-            $buildenv = $1;
-        }
-    }
-    close $FH;
+  open(my $FH, '<', '/etc/makepkg.conf') or die("Can't read makepkg.conf\n");
+  my %values;
+  my $buildenv;
+  while (my $line = <$FH>) {
+    $values{CARCH} = $1      if ($line =~ /^CARCH=["']([^"']+)/);
+    $values{PKGEXT} = $1     if ($line =~ /^PKGEXT=["']([^"']+)/);
+    $values{BUILDDIR} = $1   if ($line =~ /^BUILDDIR=["']?([^"'\n]+)/);
+    $values{SRCDEST} = $1    if ($line =~ /^SRCDEST=["']?([^"'\n]+)/);
+    $buildenv = $1 if ($line =~ /^BUILDENV=\(([^)]+)/);
+  }
+  close($FH);
 
-    if ( !defined $values{CARCH} ) {
-        die "Can't get CARCH from makepkg.conf\n";
-    }
-    if ( !defined $values{PKGEXT} ) {
-        die "Can't get PKGEXT from makepkg.conf\n";
-    }
-    if ( !defined $buildenv ) {
-        die "Can't get BUILDENV from makepkg.conf\n";
-    }
-    $values{BUILDENV} = { map { $_ => 1 } split /\s+/, $buildenv };
+  die("Can't get CARCH from makepkg.conf\n") unless (defined($values{CARCH}));
+  die("Can't get PKGEXT from makepkg.conf\n") unless (defined($values{PKGEXT}));
+  die("Can't get BUILDENV from makepkg.conf\n") unless(defined($buildenv));
+  $values{BUILDENV} = { map {$_ => 1} split(/\s+/, $buildenv) };
 
-    # Special case. These two can be overriden via environment variables
-    if ( $ENV{BUILDDIR} ) {
-        $values{BUILDDIR} = $ENV{BUILDDIR};
-    }
-    if ( $ENV{SRCDEST} ) {
-        $values{SRCDEST} = $ENV{SRCDEST};
-    }
+  # Special case. These two can be overriden via environment variables
+  $values{BUILDDIR} = $ENV{BUILDDIR} if ($ENV{BUILDDIR});
+  $values{SRCDEST} = $ENV{SRCDEST} if ($ENV{SRCDEST});
 
-    return \%values;
+  return \%values;
 }
 
 __END__
@@ -874,10 +728,6 @@ Switches include:
 =item B<-C> DIR, B<--directory>=DIR
 
 Change to directory DIR before reading repo-make.conf or doing anything else.
-
-=item B<-c> DIR, B<--chroot>=DIR
-
-Use a chroot environment for building all packages
 
 =item B<-t> PATH, B<--target>=PATH
 
