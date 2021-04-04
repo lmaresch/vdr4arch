@@ -247,7 +247,7 @@ chroot "$CHROOT" /bin/bash -c \
   pacman -Sy --noconfirm; \
   pacman -S --noconfirm --needed $PACMAN_KEYRING-keyring; \
   pacman -Su --noconfirm; \
-  pacman -S --needed --noconfirm base-devel $DISTCC; \
+  pacman -S --needed --noconfirm base-devel git $DISTCC; \
   locale-gen; \
   useradd -m build"
 
