@@ -1,0 +1,25 @@
+# This PKGBUILD is part of the VDR4Arch project [https://github.com/vdr4arch]
+
+# Maintainer: Christopher Reimer <mail+vdr4arch[at]c-reimer[dot]de>
+pkgname=vdr-skinelchihd
+pkgver=0.5.2
+_vdrapi=2.4.6
+pkgrel=1
+pkgdesc="True color and HD skin elchihd"
+url="http://firefly.vdr-developer.org/skinelchihd/"
+arch=('x86_64' 'i686')
+license=('GPL2')
+depends=('graphicsmagick' "vdr-api=${_vdrapi}")
+_plugname=${pkgname//vdr-/}
+source=("http://firefly.vdr-developer.org/skinelchihd/${pkgname}-${pkgver}.tar.bz2"
+        "50-$_plugname.conf")
+backup=("etc/vdr/conf.avail/50-$_plugname.conf")
+md5sums=('3d104cb8da0509ba0a93829a4c535fc99c459daaae99c85332a7f1f1489cc1aadac38a2e8187c2fbddab2101ae6ace82f39459e19441a35bb2ab557a790a0d1f'
+         '299a1593737b689ec512121b74a631df0ec183ad0939cdb0b9067b97164e8f1f8205f9c950d9c2a104fac28903f1d533f55a64fc08863d47ac2efdb30103c2b3')
+
+package() {
+  cd "${srcdir}/vdr-plugin-${_plugname}"
+
+  IMAGELIB=graphicsmagick make
+  install -Dm644 "$srcdir/50-$_plugname.conf" "$pkgdir/etc/vdr/conf.avail/50-$_plugname.conf"
+}
